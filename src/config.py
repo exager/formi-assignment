@@ -1,5 +1,5 @@
 import os
-
+import json
 
 class Settings:
     DATABASE_URL: str = os.getenv(
@@ -28,6 +28,18 @@ class Settings:
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "sk-mock-key-for-assessment")
     LLM_TOKENS_PER_MINUTE: int = int(os.getenv("LLM_TOKENS_PER_MINUTE", "90000"))
     LLM_REQUESTS_PER_MINUTE: int = int(os.getenv("LLM_REQUESTS_PER_MINUTE", "500"))
+
+    # Global provider token-per-minute limit
+    LLM_GLOBAL_TPM: int = int(os.getenv("LLM_GLOBAL_TPM", "90000"))
+
+    # Fallback customer budget when no explicit allocation exists
+    LLM_DEFAULT_CUSTOMER_TPM: int = int(os.getenv("LLM_DEFAULT_CUSTOMER_TPM", "10000"))
+
+    # Per-customer reserved allocations
+    LLM_CUSTOMER_TOKEN_BUDGETS: dict[str, int] = json.loads(os.getenv("LLM_CUSTOMER_TOKEN_BUDGETS", "{'mock-customer-id': 20000}"))
+
+    # Scheduler retry interval while waiting for capacity
+    LLM_SCHEDULER_RETRY_INTERVAL_SECONDS: int = int(os.getenv("LLM_SCHEDULER_RETRY_INTERVAL_SECONDS", "2"))
 
     # Average tokens consumed per post-call analysis (measured from prod logs).
     # Useful if you're trying to estimate how many calls can be processed per
