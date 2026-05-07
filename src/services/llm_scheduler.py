@@ -26,13 +26,13 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Awaitable, Callable, Dict
+from typing import Awaitable, Callable, Dict, TypeVar
 
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-
+T = TypeVar("T")
 class InteractionPriority(str, Enum):
     """Priority assigned to post-call processing requests."""
 
@@ -64,8 +64,8 @@ class TokenBucket:
     Tokens refill continuously over time.
 
     Example:
-        capacity = 90_000 TPM
-        refill_rate = 1_500 tokens/sec
+        capacity = 90000 TPM
+        refill_rate = 1500 tokens/sec
     """
 
     def __init__(self, capacity: int, refill_rate_per_second: float):
@@ -134,12 +134,11 @@ class LLMScheduler:
         for customer_id, budget in settings.LLM_CUSTOMER_TOKEN_BUDGETS.items():
             self.customer_buckets[customer_id] = TokenBucket(
                 capacity=budget,
-                refill_rate_per_second=budget / 60,
+                refill_rate_per_second=budget/60,
             )
 
-        self.retry_interval_seconds = (
-            settings.LLM_SCHEDULER_RETRY_INTERVAL_SECONDS
-        )
+        self._inflight_requests = 0
+        self._inflight_lock = asyncio.Lock()
 
     async def schedule_and_execute(
         self,
@@ -163,9 +162,7 @@ class LLMScheduler:
         customer_bucket = self._get_customer_bucket(request.customer_id)
 
         while True:
-            customer_allowed = await customer_bucket.try_consume(
-                request.estimated_tokens
-            )
+            customer_allowed = await customer_bucket.try_consume(request.estimated_tokens)
 
             if not customer_allowed:
                 logger.warning(
@@ -179,7 +176,7 @@ class LLMScheduler:
                     },
                 )
 
-                await asyncio.sleep(self.retry_interval_seconds)
+                await asyncio.sleep(self._get_retry_interval(request.priority))
                 continue
 
             global_allowed = await self.global_bucket.try_consume(
@@ -198,7 +195,7 @@ class LLMScheduler:
                     },
                 )
 
-                await asyncio.sleep(self.retry_interval_seconds)
+                await asyncio.sleep(self._get_retry_interval(request.priority))
                 continue
 
             logger.info(
@@ -212,7 +209,11 @@ class LLMScheduler:
                 },
             )
 
-            return await execute_fn()
+            await self._increment_inflight()
+            try:
+                return await execute_fn()
+            finally:
+                await self._decrement_inflight()
 
     def _get_customer_bucket(self, customer_id: str) -> TokenBucket:
         """
@@ -230,5 +231,26 @@ class LLMScheduler:
 
         return self.customer_buckets[customer_id]
 
+    def _get_retry_interval(
+        self,
+        priority: InteractionPriority,
+    ) -> float:
+
+        if priority == InteractionPriority.HIGH:
+            return settings.LLM_HIGH_PRIORITY_RETRY_INTERVAL_SECONDS
+
+        return settings.LLM_NORMAL_PRIORITY_RETRY_INTERVAL_SECONDS
+    
+    async def _increment_inflight(self) -> None:
+        """Increase the currently executing requests by 1"""
+        async with self._inflight_lock:
+            self._inflight_requests += 1
+
+
+    async def _decrement_inflight(self) -> None:
+        """Decrease the currently executing requests by 1
+        after the LLM call is processed"""
+        async with self._inflight_lock:
+            self._inflight_requests -= 1
 
 llm_scheduler = LLMScheduler()

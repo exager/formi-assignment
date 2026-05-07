@@ -30,6 +30,12 @@ from dataclasses import dataclass
 from src.config import settings
 from src.services.circuit_breaker import circuit_breaker
 
+from src.services.llm_scheduler import (
+    InteractionPriority,
+    LLMRequest,
+    llm_scheduler,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,7 +111,23 @@ class PostCallProcessor:
             )
 
             start_time = datetime.utcnow()
-            response = await self._call_llm(prompt)
+            # Before the call, take a rough estimate on the tokens that prompt will produce
+            estimated_tokens = self._estimate_tokens(prompt)
+            # Prioritise on the basis of Sparse Ranking of favourable keywords
+            priority = self._determine_priority(ctx.transcript_text)
+
+            request = LLMRequest(
+                interaction_id=ctx.interaction_id,
+                customer_id=ctx.customer_id,
+                campaign_id=ctx.campaign_id,
+                estimated_tokens=estimated_tokens,
+                priority=priority,
+            )
+
+            response = await llm_scheduler.schedule_and_execute(
+                request=request,
+                execute_fn=lambda: self._call_llm(prompt),
+            )
             elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
 
             result = self._parse_response(response, elapsed_ms)
@@ -241,5 +263,40 @@ Respond in JSON format:
             },
         )
 
+    def _estimate_tokens(self, prompt: str) -> int:
+        """
+        Lightweight token estimation.
+
+        This does not need to be exact.
+        It only needs to provide reasonable admission control estimates.
+        """
+        return max(100, int(len(prompt.split()) * 1.3))
+    
+    def _determine_priority(
+        self,
+        transcript_text: str,
+    ) -> InteractionPriority:
+        """
+        Lightweight rule-based prioritization.
+
+        High-priority interactions are processed preferentially when
+        token capacity becomes constrained.
+        """
+        normalized = transcript_text.lower()
+
+        priority_keywords = [
+            "confirmed",
+            "booked",
+            "callback",
+            "apply",
+            "buy",
+            "interested",
+            "demo",
+        ]
+
+        if any(keyword in normalized for keyword in priority_keywords):
+            return InteractionPriority.HIGH
+
+        return InteractionPriority.NORMAL
 
 post_call_processor = PostCallProcessor()

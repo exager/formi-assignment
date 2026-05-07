@@ -39,8 +39,8 @@ class Settings:
     LLM_CUSTOMER_TOKEN_BUDGETS: dict[str, int] = json.loads(os.getenv("LLM_CUSTOMER_TOKEN_BUDGETS", "{'mock-customer-id': 20000}"))
 
     # Scheduler retry interval while waiting for capacity
-    LLM_SCHEDULER_RETRY_INTERVAL_SECONDS: int = int(os.getenv("LLM_SCHEDULER_RETRY_INTERVAL_SECONDS", "2"))
-
+    LLM_NORMAL_PRIORITY_RETRY_INTERVAL_SECONDS: int = int(os.getenv("LLM_NORMAL_PRIORITY_RETRY_INTERVAL_SECONDS", "5"))
+    LLM_HIGH_PRIORITY_RETRY_INTERVAL_SECONDS: int = int(os.getenv("LLM_HIGH_PRIORITY_RETRY_INTERVAL_SECONDS", "2"))
     # Average tokens consumed per post-call analysis (measured from prod logs).
     # Useful if you're trying to estimate how many calls can be processed per
     # minute before hitting LLM_TOKENS_PER_MINUTE.
