@@ -26,7 +26,6 @@ A few things to notice as you read this file:
    when, or why.
 """
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -93,101 +92,50 @@ async def end_interaction(
             call_sid=request.call_sid,
         )
 
-        transcript = interaction.get("conversation_data", {}).get("transcript", [])
-        is_short = len(transcript) < 4
+        # Since the endpoints should ideally stay clear of any business logic,
+        # here the short transcription check is removed, and moved further down 
+        # line to post_call_processor, after which, all transcripts will be properly
+        # logged into the system, maintaining the downstream as well
+        # For long transcripts, the duplicate signal calls are redundant, so
+        # those are also deleted from here and kept in the celery task only
+        # No need for "best effort early trigger"
 
-        if is_short:
-            # Fewer than 4 turns: wrong number, immediate hangup, network drop.
-            # Skip LLM — there's nothing meaningful to extract.
-            # Signal jobs still fire so the lead stage gets updated.
-            logger.info(
-                "short_transcript_fast_path",
-                extra={"interaction_id": str(interaction_id)},
-            )
+        celery_payload = {
+            "interaction_id": str(interaction_id),
+            "session_id": str(session_id),
+            "lead_id": interaction["lead_id"],
+            "campaign_id": interaction["campaign_id"],
+            "customer_id": interaction["customer_id"],
+            "agent_id": interaction["agent_id"],
+            "call_sid": request.call_sid,
+            "transcript": interaction.get("conversation_data", {}).get("transcript", []),
+            "conversation_data": interaction.get("conversation_data", {}),
+            "additional_data": request.additional_data or {},
+            "ended_at": datetime.utcnow().isoformat(),
+            "exotel_account_id": interaction.get("exotel_account_id"),
+        }
 
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="short_call",
-                )
-            )
+        task = process_interaction_end_background_task.apply_async(
+            args=[celery_payload],
+            queue="postcall_processing",  # One queue to rule them all
+        )
 
-        else:
-            # Long transcript: pack everything into a Celery payload and enqueue.
-            # All calls get the same queue, same priority, same processing path —
-            # regardless of whether the call resulted in a confirmed booking or
-            # a customer hanging up after one sentence.
-            transcript_text = "\n".join(
-                f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
-                for turn in transcript
-            )
-
-            celery_payload = {
+        logger.info(
+            "postcall_enqueued",
+            extra={
                 "interaction_id": str(interaction_id),
-                "session_id": str(session_id),
-                "lead_id": interaction["lead_id"],
-                "campaign_id": interaction["campaign_id"],
                 "customer_id": interaction["customer_id"],
-                "agent_id": interaction["agent_id"],
-                "call_sid": request.call_sid,
-                "transcript_text": transcript_text,
-                "conversation_data": interaction.get("conversation_data", {}),
-                "additional_data": request.additional_data or {},
-                "ended_at": datetime.utcnow().isoformat(),
-                "exotel_account_id": interaction.get("exotel_account_id"),
-            }
-
-            task = process_interaction_end_background_task.apply_async(
-                args=[celery_payload],
-                queue="postcall_processing",  # One queue to rule them all
-            )
-
-            logger.info(
-                "postcall_enqueued",
-                extra={
-                    "interaction_id": str(interaction_id),
-                    "celery_task_id": task.id,
-                    # Notice what's NOT logged here: no queue depth, no estimated
-                    # wait time, no indication of how backed up we are.
-                },
-            )
-
-            # These fire immediately — before Celery has done anything.
-            # analysis_result={} means downstream gets an empty analysis.
-            # This was supposed to be a "best effort early trigger" but it
-            # mostly just sends empty payloads to signal_jobs.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={},  # ← Celery hasn't run yet. This is empty.
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="processing",  # ← Placeholder, not a real outcome
-                )
-            )
+                "campaign_id": interaction["campaign_id"],
+                "celery_task_id": task.id,
+                # Notice what's NOT logged here: no queue depth, no estimated
+                # wait time, no indication of how backed up we are.
+            },
+        )
 
         return InteractionEndResponse(
             status="ok",
             interaction_id=str(interaction_id),
-            message="Interaction ended, processing enqueued",
+            message=""Post-call processing scheduled"",
         )
 
     except HTTPException:

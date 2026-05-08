@@ -172,6 +172,7 @@ class LLMScheduler:
                         "customer_id": request.customer_id,
                         "campaign_id": request.campaign_id,
                         "estimated_tokens": request.estimated_tokens,
+                        "in_flight_requests": self._inflight_requests,
                         "priority": request.priority.value,
                     },
                 )
@@ -191,6 +192,7 @@ class LLMScheduler:
                         "customer_id": request.customer_id,
                         "campaign_id": request.campaign_id,
                         "estimated_tokens": request.estimated_tokens,
+                        "in_flight_requests": self._inflight_requests,
                         "priority": request.priority.value,
                     },
                 )
@@ -205,6 +207,7 @@ class LLMScheduler:
                     "customer_id": request.customer_id,
                     "campaign_id": request.campaign_id,
                     "estimated_tokens": request.estimated_tokens,
+                    "in_flight_requests": self._inflight_requests,
                     "priority": request.priority.value,
                 },
             )

@@ -103,6 +103,30 @@ class PostCallProcessor:
         # called by the dialler — not here, before spending the tokens.
         await circuit_breaker.record_postcall_start()
 
+        # Placing the short transcript call text here, so that the endpoints
+        # stay logic-free, and no duplication of celery tasks take place, for
+        # any kind of transcript received.
+        if self._should_skip_llm(transcript_text):
+            logger.info(
+                "llm_processing_skipped_short_transcript",
+                extra={
+                    "interaction_id": ctx.interaction_id,
+                    "customer_id": ctx.customer_id,
+                    "campaign_id": ctx.campaign_id,
+                    "transcript_turns": len(transcript_text),
+                },
+            )
+
+            return AnalysisResult(
+                raw_response={"call_stage": "short_call"},
+                summary="short_transcript",
+            )
+        
+        transcript_text = "\n".join(
+            f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
+            for turn in ctx.transcript_text
+        )
+
         try:
             prompt = self._build_analysis_prompt(
                 ctx.transcript_text,
@@ -298,5 +322,22 @@ Respond in JSON format:
             return InteractionPriority.HIGH
 
         return InteractionPriority.NORMAL
+
+    def _should_skip_llm(
+        self,
+        transcript: list[dict[str, str]],
+    ) -> bool:
+        """
+        Determine whether an interaction should bypass LLM processing.
+
+        Skip conditions:
+        - Very short transcript
+        - Empty transcript
+        - Low-information interactions
+        """
+        if not transcript:
+            return True
+
+        return len(transcript) < 4
 
 post_call_processor = PostCallProcessor()
