@@ -30,13 +30,22 @@ sequentially. What would need to change for them to run in parallel?
 import asyncio
 import logging
 from typing import Optional
-
+from enum import Enum
 import httpx
 
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+class RecordingFetchStatus(str, Enum):
+    READY = "ready"
+    NOT_READY = "not_ready"
+    FAILED = "failed"
+
+@dataclass(slots=True)
+class RecordingFetchResult:
+    status: RecordingFetchStatus
+    recording_url: str | None = None
 
 async def fetch_and_upload_recording(
     interaction_id: str,
@@ -57,43 +66,63 @@ async def fetch_and_upload_recording(
     # the LLM quota is sitting idle, the analysis hasn't started, and the
     # dashboard still shows "processing" for what might be a confirmed rebook
     # that the sales team is waiting to act on.
-    await asyncio.sleep(settings.RECORDING_WAIT_SECONDS)
+    attempt = 1
+    for time_delay in settings.RECORDING_WAIT_SECONDS:
+        await asyncio.sleep(time_delay)
 
-    try:
-        recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
+        try:
+            recording_result = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
 
-        if not recording_url:
-            # Not available after 45s. We move on. No record that we tried.
-            # An ops engineer investigating "why is there no recording for
-            # interaction X?" has no log entry to find.
-            logger.debug(
-                "recording_not_available",
-                extra={
-                    "interaction_id": interaction_id,
-                    "call_sid": call_sid,
-                    "waited_seconds": settings.RECORDING_WAIT_SECONDS,
-                },
+            if recording_result.status.value == RecordingFetchStatus.NOT_READY.value:
+                # Not available after the time delay. We wait for the other time-gaps. 
+                # And with proper logging of these events, this will be useful further in
+                # telemetry and data validations...
+                logger.debug(
+                    "recording_retry_scheduled",
+                    extra={
+                        "interaction_id": interaction_id,
+                        "call_sid": call_sid,
+                        "attempt": attempt,
+                        "waited_seconds": time_delay,
+                    },
+                )
+            
+            elif recording_result.status.value == RecordingFetchStatus.READY.value:
+                # Found the recording, upload it to the URL
+                s3_key = await _upload_to_s3(recording_result.recording_url, interaction_id)
+                logger.info(
+                    "recording_upload_successful",
+                    extra={
+                        "interaction_id": interaction_id,
+                        "call_sid": call_sid,
+                    },
+                )
+                return s3_key
+            else:
+                # This is for some failure (httpx or any other) from Exotel's side
+                logger.exception(
+                    "recording_fetch_error",
+                    extra={
+                        "interaction_id": interaction_id,
+                        "reason": "Failure at upstream while getting the recording details",
+                        },
+                )
+
+        except Exception as e:
+            # Exception is caught here and swallowed. The caller (Celery task)
+            # doesn't know whether this succeeded, failed, or was skipped.
+            # It logs at ERROR level, which is at least visible — but there's
+            # no retry path and no way to replay just the recording upload later.
+            logger.exception(
+                "recording_upload_error",
+                extra={"interaction_id": interaction_id, "error": str(e)},
             )
             return None
-
-        s3_key = await _upload_to_s3(recording_url, interaction_id)
-        return s3_key
-
-    except Exception as e:
-        # Exception is caught here and swallowed. The caller (Celery task)
-        # doesn't know whether this succeeded, failed, or was skipped.
-        # It logs at ERROR level, which is at least visible — but there's
-        # no retry path and no way to replay just the recording upload later.
-        logger.exception(
-            "recording_upload_error",
-            extra={"interaction_id": interaction_id, "error": str(e)},
-        )
-        return None
 
 
 async def _fetch_exotel_recording_url(
     call_sid: str, account_id: str
-) -> Optional[str]:
+) -> RecordingFetchResult:
     """
     Hit the Exotel API to get the recording URL for a completed call.
 
@@ -109,10 +138,18 @@ async def _fetch_exotel_recording_url(
             resp = await client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get("recording_url")
-            return None
+                return RecordingFetchResult(status=RecordingFetchStatus.READY,recording_url=data.get("recording_url"))
+            #Try after some wait period
+            if resp.status_code ==404:
+                return RecordingFetchResult(status=RecordingFetchStatus.NOT_READY,recording_url=None)
+    
+    except httpx.TimeoutException:
+        # Timeouts return NOT_READY for still processing files(just for the case when timeouts happen since file is not fully uploaded by exotel)
+        return RecordingFetchResult(status=RecordingFetchStatus.NOT_READY, recording_url=None)
+
     except httpx.HTTPError:
-        return None
+        # This is failure from Exotel's end
+        return RecordingFetchResult(status=RecordingFetchStatus.FAILED,recording_url=None)
 
 
 async def _upload_to_s3(recording_url: str, interaction_id: str) -> str:

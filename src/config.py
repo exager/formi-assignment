@@ -50,7 +50,15 @@ class Settings:
     # Why 45 seconds? Someone measured the average Exotel delivery time once,
     # added a buffer, and hardcoded it. That was on a quiet Friday afternoon.
     # Under load the delivery window is 10s–120s with no guarantee.
-    RECORDING_WAIT_SECONDS: int = 45
+    # ------------------------
+    # Updated: the wait seconds to a list of time intervals.
+    # Now the request will be fired at times 10s,30s,45s,60s,90s,120s
+    # and the moment it receives the file upload, it will stop. Although this
+    # design may wait for a maximum of 120s, atleast it will not result in None
+    # for the file, and no data would be lost
+    # Improvement: Parallel processing for call data and LLM analysis
+    RECORDING_WAIT_SECONDS: list[int] = [int(i) for i in os.getenv("RECORDING_WAIT_SECONDS", "10,20,15,15,30,30").split(",")]
+
     S3_BUCKET: str = os.getenv("S3_BUCKET", "voicebot-recordings")
 
     # ── Circuit breaker ───────────────────────────────────────────────────────
