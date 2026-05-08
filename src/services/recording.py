@@ -30,17 +30,12 @@ sequentially. What would need to change for them to run in parallel?
 import asyncio
 import logging
 from typing import Optional
-from enum import Enum
 import httpx
-
+from src.models.enums import RecordingFetchStatus
 from src.config import settings
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-
-class RecordingFetchStatus(str, Enum):
-    READY = "ready"
-    NOT_READY = "not_ready"
-    FAILED = "failed"
 
 @dataclass(slots=True)
 class RecordingFetchResult:
@@ -66,13 +61,28 @@ async def fetch_and_upload_recording(
     # the LLM quota is sitting idle, the analysis hasn't started, and the
     # dashboard still shows "processing" for what might be a confirmed rebook
     # that the sales team is waiting to act on.
-    attempt = 1
+    attempt = 0
     for time_delay in settings.RECORDING_WAIT_SECONDS:
+        attempt += 1
         await asyncio.sleep(time_delay)
 
         try:
             recording_result = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
 
+            if recording_result.status.value == RecordingFetchStatus.READY.value:
+                # Found the recording, upload it to the URL
+                s3_key = await _upload_to_s3(recording_result.recording_url, interaction_id)
+                logger.info(
+                    "recording_upload_successful",
+                    extra={
+                        "interaction_id": interaction_id,
+                        "call_sid": call_sid,
+                        "recording_retry_count": attempt-1,
+                        "recording_failure_reason": None,
+                    },
+                )
+                return s3_key
+            
             if recording_result.status.value == RecordingFetchStatus.NOT_READY.value:
                 # Not available after the time delay. We wait for the other time-gaps. 
                 # And with proper logging of these events, this will be useful further in
@@ -86,25 +96,16 @@ async def fetch_and_upload_recording(
                         "waited_seconds": time_delay,
                     },
                 )
-            
-            elif recording_result.status.value == RecordingFetchStatus.READY.value:
-                # Found the recording, upload it to the URL
-                s3_key = await _upload_to_s3(recording_result.recording_url, interaction_id)
-                logger.info(
-                    "recording_upload_successful",
-                    extra={
-                        "interaction_id": interaction_id,
-                        "call_sid": call_sid,
-                    },
-                )
-                return s3_key
+
             else:
                 # This is for some failure (httpx or any other) from Exotel's side
                 logger.exception(
                     "recording_fetch_error",
                     extra={
                         "interaction_id": interaction_id,
-                        "reason": "Failure at upstream while getting the recording details",
+                        "call_sid": call_sid,
+                        "recording_retry_count": attempt-1,
+                        "recording_failure_reason": "Failure at upstream while getting the recording details",
                         },
                 )
 
@@ -113,11 +114,21 @@ async def fetch_and_upload_recording(
             # doesn't know whether this succeeded, failed, or was skipped.
             # It logs at ERROR level, which is at least visible — but there's
             # no retry path and no way to replay just the recording upload later.
-            logger.exception(
+            logger.error(
                 "recording_upload_error",
                 extra={"interaction_id": interaction_id, "error": str(e)},
             )
             return None
+        
+    logger.error(
+        "recording_fetch_exhausted",
+        extra={
+            "interaction_id": interaction_id,
+            "call_sid": call_sid,
+            "attempts": attempt,
+        },
+    )
+    return None
 
 
 async def _fetch_exotel_recording_url(

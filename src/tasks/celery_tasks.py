@@ -87,9 +87,9 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
                 "attempt": self.request.retries,
             },
         )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
+        # Failed tasks earlier went into PostCallRetryQueue (Redis) AND Celery retries.
+        # Two retry mechanisms that don't know about each other. 
+        #Removing the Celery retry for now to prevent race conditions and extra workloads.
         loop.run_until_complete(
             retry_queue.enqueue_retry(
                 interaction_id=payload["interaction_id"],
@@ -97,7 +97,7 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
                 payload=payload,
             )
         )
-        raise self.retry(exc=e)
+        # raise self.retry(exc=e)
     finally:
         loop.close()
 
@@ -122,41 +122,71 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         exotel_account_id=payload.get("exotel_account_id"),
     )
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
+    # Create the instance for post call processing and parallelize  
+    # the recording and LLM calls,since both are independent, 
+    # time constrained and have chances of getting retried.
     #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
+    # Additionally, when the context for recording and s3 upload task is 
+    # in-waiting, the celery task and LLM processing will not sit idle,
+    # This will efficiently improve token usage across all customers and
+    # campaigns. 
+
+    processor = PostCallProcessor()
+
+    # ── Step 1: Recording ─────────────────────────────────────────────────────
+    # Blocks here for few seconds seconds waiting for Exotel to make the recording
+    # available. Meanwhile, the LLM analysis (step 2) will also start asynchronously,
+    # since it has zero dependency on the recording.
+    #
+    # Recording step will wait in steps of 10,15,15,20,30,30 seconds or as defined in 
+    # the config. This way, if the file has arrived in 30 seconds, there will not be 
+    # much overhead of wait for this task to end. And even if the wait is 2 minutes,
+    # it will still process the recording.
+    
+    recording_task = asyncio.create_task(
+        fetch_and_upload_recording(
+            interaction_id=ctx.interaction_id,
+            call_sid=ctx.call_sid,
+            exotel_account_id=ctx.exotel_account_id or "",
+        )
     )
 
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
-        )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
 
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
+    # ── Step 2: LLM analysis (Concurrent)──────────────────────────────────────────────────
+    # Full analysis on every call. 1,500 tokens average. Now with pre-screening on 
+    # token availability. If the tokens are not available, the system will retry after
+    # some time based on the interaction priority
     #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
+    # The LLM rate limit (settings.LLM_CUSTOMER_TOKEN_BUDGETS) is checked before
+    # the actual LLM call. If we're over the limit, the controlled waits and retries
+    # till the tokens are replenished enough to process the query.
+    
+    llm_task = asyncio.create_task(
+        processor.process_post_call(
+            ctx,
+            single_prompt=True,
+        )
+    )
+    recording_s3_key, llm_result = await asyncio.gather(
+        recording_task,
+        llm_task,
+        return_exceptions=True,
+    )
 
+    if recording_s3_key is None:
+        # If recording_s3_key is None, flag it as an exception
+        logger.exception(
+            "recording_pipeline_failed",
+            extra={
+                "interaction_id": interaction_id,
+                "error": "Recording upload error"
+            },
+        )
+
+    if isinstance(llm_result,Exception):
+        raise llm_result
     await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+        interaction_id, llm_result.tokens_used, llm_result.latency_ms
     )
 
     # ── Step 3: Signal jobs ───────────────────────────────────────────────────
@@ -170,7 +200,7 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             interaction_id=ctx.interaction_id,
             session_id=ctx.session_id,
             campaign_id=ctx.campaign_id,
-            analysis_result=result.raw_response,
+            analysis_result=llm_result.raw_response,
         )
     except Exception as e:
         logger.warning("signal_jobs_failed", extra={"error": str(e)})
@@ -183,7 +213,7 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         await update_lead_stage(
             lead_id=ctx.lead_id,
             interaction_id=ctx.interaction_id,
-            call_stage=result.call_stage,
+            call_stage=llm_result.call_stage,
         )
     except Exception as e:
         logger.warning("lead_stage_update_failed", extra={"error": str(e)})

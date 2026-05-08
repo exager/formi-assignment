@@ -57,7 +57,7 @@ class Settings:
     # design may wait for a maximum of 120s, atleast it will not result in None
     # for the file, and no data would be lost
     # Improvement: Parallel processing for call data and LLM analysis
-    RECORDING_WAIT_SECONDS: list[int] = [int(i) for i in os.getenv("RECORDING_WAIT_SECONDS", "10,20,15,15,30,30").split(",")]
+    RECORDING_WAIT_SECONDS: list[int] = [int(i) for i in os.getenv("RECORDING_WAIT_SECONDS", "10,15,15,20,30,30").split(",")]
 
     S3_BUCKET: str = os.getenv("S3_BUCKET", "voicebot-recordings")
 

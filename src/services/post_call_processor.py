@@ -25,7 +25,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from src.config import settings
 from src.services.circuit_breaker import circuit_breaker
@@ -58,14 +58,14 @@ class PostCallContext:
 
 @dataclass
 class AnalysisResult:
-    call_stage: str          # Disposition: rebook_confirmed, not_interested, etc.
-    entities: Dict[str, Any] # Structured entities extracted from the transcript
-    summary: str             # Human-readable summary for dashboard display
-    raw_response: Dict[str, Any]
-    tokens_used: int         # Actual tokens consumed — source of truth for billing
-    latency_ms: float
-    provider: str
-    model: str
+    call_stage: str = ""                                    # Disposition: rebook_confirmed, not_interested, etc.
+    entities: Dict[str, Any] = field(default_factory=dict)  # Structured entities extracted from the transcript
+    summary: str = ""                                       # Human-readable summary for dashboard display
+    raw_response: Dict[str, Any] = field(default_factory=dict)
+    tokens_used: int = 0                                    # Actual tokens consumed — source of truth for billing
+    latency_ms: float = 0
+    provider: str = "default"
+    model: str = "default"
 
 
 class PostCallProcessor:
@@ -117,9 +117,13 @@ class PostCallProcessor:
                 },
             )
 
+            await circuit_breaker.record_postcall_end()
+
             return AnalysisResult(
                 raw_response={"call_stage": "short_call"},
                 summary="short_transcript",
+                tokens_used=0,
+                latency_ms=0.0,
             )
         
         transcript_text = "\n".join(
@@ -175,7 +179,12 @@ class PostCallProcessor:
                 },
             )
 
-            return result
+            analysis_result =  AnalysisResult(
+                call_stage=result.call_stage,
+                raw_response=response,
+                tokens_used=result.tokens_used, 
+                latency_ms=result.latency_ms,
+            )
 
         except Exception as e:
             logger.exception(
@@ -193,6 +202,8 @@ class PostCallProcessor:
 
         finally:
             await circuit_breaker.record_postcall_end()
+        
+        return analysis_result
 
     def _build_analysis_prompt(
         self,
