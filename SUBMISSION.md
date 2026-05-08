@@ -1,7 +1,7 @@
 # Post-Call Processing Pipeline — Design Document
 
-**Author:** [Your Name]
-**Date:** [Date]
+**Author:** Sahil Singh
+**Date:** 08-05-2026
 
 ---
 
@@ -184,6 +184,17 @@ Before executing an LLM request, the scheduler evaluates:
 Only requests that satisfy all constraints are admitted immediately.
 
 All others are deferred into a scheduling queue instead of being failed.
+
+### Scheduler vs CircuitBreaker
+
+The scheduler becomes the primary admission-control mechanism.
+
+The existing circuit breaker is retained as a lightweight telemetry and emergency safety layer, but proactive token admission control now occurs before requests are sent to the LLM provider.
+
+This shifts overload handling from:
+- reactive request failure handling,
+to:
+- proactive capacity-aware scheduling.
 
 ### Token accounting
 
@@ -453,7 +464,9 @@ The new recording pipeline is designed to:
 
 ### Decoupled execution
 
-Recording retrieval and LLM analysis are treated as independent tasks.
+Recording retrieval and LLM analysis now execute independently and concurrently using asyncio.gather(...).
+
+This avoids idle worker time during recording polling and improves throughput during large campaign bursts.
 
 Instead of executing sequentially:
 
@@ -483,7 +496,7 @@ The recording service polls Exotel periodically until:
 The scheduler uses exponential backoff between retries. Example retry intervals:
 
 ```text
-5s → 10s → 20s → 40s → 60s
+10s → 15s → 15s → 20s → 30 → 30s
 ```
 
 This approach:
@@ -533,166 +546,641 @@ Example structured log:
 
 ---
 
+
 ## 8. Reliability & Durability
 
-The redesigned system treats durability as a first-class concern.
+The redesigned system improves reliability by introducing durable processing state, centralized retry orchestration, and structured recovery visibility.
 
 The primary design goal is:
 
+> Prevent silent interaction loss and make all failures observable and replayable.
 > No interaction should be permanently lost due to worker crashes, Redis failures, retries, or transient infrastructure problems.
+
+The current implementation improves recoverability significantly compared to the original system, while still acknowledging some remaining infrastructure limitations.
 
 ### Interaction as source of truth
 
-The interaction record becomes the durable execution source of truth.
+The interaction record becomes the durable execution source of truth for post-call processing.
 
-Instead of relying on:
-- in-memory async tasks,
-- Redis-only retry queues,
-- or Celery task state,
+Instead of relying entirely on:
+- in-memory async execution,
+- transient Celery worker state,
+- or untracked retries,
 
-the processing lifecycle is persisted directly against the interaction.
+the processing lifecycle is persisted inside `interaction_metadata`.
 
-Each interaction stores explicit processing state such as:
+Each interaction stores execution metadata such as:
 - processing_status
 - recording_status
-- llm_status
 - retry_count
+- processing timestamps
 - last_error
 
-This allows the system to recover processing progress even after infrastructure restarts.
+This allows operators to inspect and recover interaction state even after worker failures or delayed retries.
 
 ### Durable execution flow
 
-The webhook layer only:
-1. persists interaction state,
-2. and enqueues durable work.
+The webhook layer performs only lightweight ingestion responsibilities:
+1. persist interaction state,
+2. enqueue asynchronous work,
+3. return immediately.
 
-All business logic executes inside workers.
+All expensive operations execute asynchronously inside workers.
 
-This removes fire-and-forget execution paths such as `asyncio.create_task(...)`, which currently lose tasks during process crashes.
+This prevents long-running post-call analysis from blocking webhook responsiveness and reduces the risk of request timeout failures.
 
-### Consolidated retry handling
+### Centralized retry orchestration
 
-The existing design contains two independent retry systems:
+The original implementation contained overlapping retry mechanisms:
 - Celery retries,
-- and a Redis retry queue.
+- and a separate Redis retry queue.
 
-These systems can both retry the same interaction, causing duplicate execution.
+These systems could retry the same interaction independently, creating duplicate processing risk and inconsistent retry visibility.
 
-The redesign removes the separate Redis retry queue and standardizes retry handling through a single retry path.
+The redesigned system consolidates retry ownership into a single retry orchestration layer.
 
-Retries become:
-- centralized,
-- observable,
-- and idempotent.
+Failed interactions are:
+- persisted into the retry queue,
+- replayed through a retry poller,
+- retried with exponential backoff,
+- and logged with structured retry metadata.
 
-### Idempotent processing
+This improves retry visibility and operational traceability while reducing conflicting retry execution paths.
 
-Workers check interaction processing state before executing expensive operations.
+### Worker crash recovery
 
-Examples:
-- completed LLM analysis is not re-run,
-- completed recording uploads are not duplicated,
-- downstream actions are not triggered twice.
+Celery tasks are configured with:
+- `acks_late=True`
+- `task_reject_on_worker_lost=True`
 
-This prevents duplicate processing during retries or worker redelivery.
+This ensures tasks are acknowledged only after successful execution.
 
-### Failure recovery
+If a worker crashes mid-processing:
+- the task is returned to the broker,
+- replayed automatically,
+- and resumed using persisted interaction state.
 
-Failures are categorized into:
-- retryable failures,
-- and terminal failures.
+Additionally, interactions entering `PROCESSING` state persist lifecycle metadata such as:
+- processing_started_at
+- processing_status
 
-Examples:
-- 429 rate limits → retryable
-- transient DB/network failures → retryable
-- invalid payload structure → terminal
+Retries detecting abandoned processing states emit structured recovery logs, improving visibility into interrupted executions.
 
-Retryable failures are deferred automatically using scheduler-aware retry logic.
+### Retry visibility
 
-Terminal failures:
-- update durable interaction state,
-- emit structured alerts,
-- and remain replayable later.
+Retries are treated as observable operational events rather than silent background behaviour.
 
-### Removal of Redis-only durability
+The system logs:
+- retry scheduling,
+- retry replay,
+- retry exhaustion,
+- and recovery attempts
 
-The previous retry design depended entirely on Redis:
-- broker queue,
-- retry queue,
-- retry counters.
+using structured log events containing:
+- interaction_id
+- correlation_id
+- retry_count
+- failure_reason
+- processing stage
 
-This created a shared failure domain where Redis outages could lose both primary and retry execution paths simultaneously.
-The redesign reduces dependence on ephemeral Redis state and stores execution progress durably in the database.
+This improves debuggability during high-volume campaign failures.
 
-### Natural backpressure instead of failure amplification
+### Current durability limitations
 
-The current design amplifies overload:
-- provider 429s trigger retries,
-- retries increase queue depth,
-- queue growth increases latency,
-- and the system destabilizes further.
+The current implementation still retains some dependence on Redis durability.
 
-The scheduler prevents this by enforcing admission control before requests are sent to the LLM provider.
+Specifically:
+- Celery broker state,
+- retry queue state,
+- and retry scheduling metadata
 
-Interactions are queued before overload occurs instead of failing after overload has already started.
+are Redis-backed.
 
-This converts overload from:
-- failure amplification,
+As a result, a Redis outage or restart can still affect retry durability.
+
+The redesign reduces dependence on transient execution state by persisting interaction lifecycle metadata inside the database, but retry orchestration itself is not yet fully durable.
+
+A production implementation would likely:
+- move retry orchestration to Kafka/SQS/DB-backed queues,
+- centralize scheduler coordination in Redis or another distributed store,
+- and introduce dead-letter replay workflows.
+
+### Backpressure instead of failure amplification
+
+The redesigned scheduler introduces proactive admission control before requests reach the LLM provider.
+
+Instead of:
+- overloading the provider,
+- receiving large waves of 429 responses,
+- and amplifying retries,
+
+the scheduler:
+- evaluates token availability,
+- defers excess work,
+- and gradually slows throughput under load.
+
+This converts overload behaviour from:
+- cascading failure amplification,
 into:
-- controlled throughput degradation.
+- controlled throughput degradation with retry visibility.
 
 ---
 
 ## 9. Auditability & Observability
 
-_How would you debug a specific failed interaction 3 days after the fact?_
+The redesigned system introduces structured, correlation-aware observability across the entire post-call processing pipeline.
 
-### What you log (and what fields every log event includes)
+The primary goal is:
+
+> Every interaction should be traceable end-to-end across asynchronous workers, retries, recording fetches, scheduler decisions, and downstream updates.
+
+This significantly improves operational debugging, replayability, and customer-level auditability.
+
+### End-to-end traceability
+
+Every interaction is assigned a `correlation_id` at webhook ingress.
+
+This correlation ID propagates through:
+- Celery task execution,
+- retry queue orchestration,
+- recording polling,
+- scheduler decisions,
+- LLM execution,
+- downstream signal jobs,
+- and lead stage updates.
+
+This allows operators to trace the complete lifecycle of an interaction across multiple asynchronous systems using a single identifier.
+
+### Durable interaction lifecycle visibility
+
+Each interaction persists processing lifecycle metadata inside `interaction_metadata`.
+
+This includes:
+- processing_status
+- llm_status
+- recording_status
+- retry_count
+- processing timestamps
+- failure metadata
+- last_error
+
+Example lifecycle transitions:
+
+```text
+PENDING
+    ↓
+PROCESSING
+    ↓
+COMPLETED / FAILED
+```
+
+This allows debugging even after:
+- worker restarts,
+- delayed retries,
+- or transient infrastructure failures.
+
+### Structured logging
+
+All operational events emit structured logs. Every log event includes:
+- interaction_id
+- correlation_id
+- customer_id
+- campaign_id
+- processing stage
+- retry metadata (if applicable)
+- error information (for failure events)
+
+Example processing stages:
+
+```json
+{
+  "interaction_id": "123",
+  "correlation_id": "abc-xyz",
+  "customer_id": "cust_001",
+  "campaign_id": "cmp_001",
+  "stage": "recording_fetch",
+  "status": "failed",
+  "retry_count": 3,
+  "error": "recording_not_available"
+}
+```
+
+### Retry observability
+
+Retries are treated as explicit operational events rather than silent background behaviour.
+
+The system emits structured logs for:
+- retry scheduling,
+- retry replay,
+- retry exhaustion,
+- and interrupted processing recovery.
+
+Each retry event includes:
+- interaction_id,
+- correlation_id,
+- retry_count,
+- failure_reason,
+- and processing stage.
+
+This allows operators to:
+- identify retry storms,
+- inspect permanently failing interactions,
+- trace replay attempts,
+- and manually recover failed workloads when necessary.
+
+### Queue visibility
+
+The redesigned system improves operational visibility into asynchronous workload pressure.
+
+The system tracks:
+- retry queue depth,
+- deferred interaction counts,
+- scheduler backlog,
+- and token utilization pressure.
+
+These metrics help operators identify:
+- overload conditions,
+- provider throttling pressure,
+- uneven customer workload distribution,
+- and growing retry backlog conditions before they become outages.
 
 ### Alert conditions
+
+The following events are treated as alertable operational conditions:
+
+| Condition | Reason |
+|---|---|
+| Retry exhaustion | Interaction exceeded maximum retry attempts and requires manual investigation or replay |
+| Recording upload failure | Recording could not be fetched from Exotel or failed during upload/storage operations |
+| Large scheduler backlog | LLM token capacity saturation or sustained queue pressure |
+| Repeated provider throttling (429 responses) | Indicates sustained provider-side rate limiting despite scheduler admission control and retry backoff |
+| Worker recovery events | Indicates interrupted task execution that was replayed after worker loss due to `acks_late=True` and `task_reject_on_worker_lost=True` |
+| Excessive retry queue growth | Persistent downstream failures, provider instability, or prolonged overload conditions |
+| Interactions stuck in PROCESSING state | Possible abandoned execution caused by worker interruption or repeated retry failures |
+
+### Debugging a failed interaction after several days
+
+To debug a failed interaction, an operator can:
+
+1. Query the interaction using `interaction_id`
+2. Inspect durable processing metadata stored in `interaction_metadata`
+3. Search structured logs using `correlation_id`
+4. Review retry attempts and failure history
+5. Inspect scheduler admission and defer decisions
+6. Determine whether the interaction:
+   - failed permanently,
+   - exhausted retries,
+   - was replayed successfully,
+   - or remains deferred awaiting capacity
+
+This provides significantly stronger operational visibility compared to the original implementation, where failures could silently disappear across asynchronous execution boundaries.
 
 ---
 
 ## 10. Data Model
 
-_Schema changes required. Show the SQL._
+The current implementation intentionally minimizes schema churn and reuses the existing `interaction_metadata` JSONB column for workflow state persistence.
 
-```sql
--- Your schema additions/changes here
+This allowed the redesign to:
+- avoid large migration risk,
+- remain backward compatible,
+- and rapidly introduce durable processing state without restructuring core interaction models.
+
+The following workflow metadata is now persisted inside `interaction_metadata`:
+
+- processing_status
+- recording_status
+- llm_status
+- retry_count
+- processing timestamps
+- last_error
+- token usage metadata
+
+Example structure:
+
+```json
+{
+  "processing_status": "processing",
+  "recording_status": "uploaded",
+  "llm_status": "completed",
+  "retry_count": 1,
+  "tokens_used": 1320,
+  "processing_started_at": "2026-05-08T10:00:00Z",
+  "processing_completed_at": "2026-05-08T10:00:12Z",
+  "last_error": null
+}
 ```
+
+Why JSONB was reused
+
+Using JSONB allowed:
+- incremental rollout,
+- flexible workflow evolution,
+- and reduced migration complexity during rapid iteration.
+
+This was particularly useful because workflow state requirements were still evolving during redesign.
+
+### Recommended production schema evolution
+
+For long-term scalability and observability, several fields would likely be promoted into dedicated indexed columns or tables.
+
+Example future schema additions:
+```sql
+ALTER TABLE interactions
+ADD COLUMN processing_status VARCHAR(50),
+ADD COLUMN recording_status VARCHAR(50),
+ADD COLUMN llm_status VARCHAR(50),
+ADD COLUMN retry_count INTEGER DEFAULT 0,
+ADD COLUMN correlation_id UUID,
+ADD COLUMN last_error TEXT,
+ADD COLUMN processing_started_at TIMESTAMP,
+ADD COLUMN processing_completed_at TIMESTAMP;
+
+CREATE INDEX idx_interactions_processing_status
+ON interactions(processing_status);
+
+CREATE INDEX idx_interactions_correlation_id
+ON interactions(correlation_id);
+```
+
+And for high-scale production observability, retry history and lifecycle events would likely move into a dedicated append-only audit table.
+
+Example:
+```sql
+CREATE TABLE interaction_processing_events (
+    id UUID PRIMARY KEY,
+    interaction_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
+    stage VARCHAR(100),
+    status VARCHAR(50),
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+This would provide:
+- immutable execution history,
+- replay visibility,
+- operational debugging support,
+- and customer-level audit trails.
 
 ---
 
 ## 11. Security
 
-_What data in this system is sensitive? How do you protect it at rest and in transit?_
+The post-call processing pipeline handles multiple categories of sensitive data, including:
+- customer PII (phone numbers, emails, names),
+- call transcripts,
+- call recordings,
+- extracted entities,
+- and customer-specific operational metadata.
+
+### Data in transit
+
+All communication between services should occur over TLS-secured channels, including:
+- webhook ingestion,
+- Exotel API calls,
+- LLM provider requests,
+- Redis communication,
+- and object storage uploads.
+
+This prevents interception of transcripts, recordings, and customer metadata across network boundaries.
+
+### Data at rest
+
+Sensitive data should remain encrypted at rest:
+- recordings stored in encrypted S3 buckets,
+- database storage protected using disk-level encryption,
+- and Redis deployments restricted to private network boundaries.
+
+Access to recordings and transcripts should follow least-privilege access policies.
+
+### Logging & observability safety
+
+Structured logging intentionally avoids dumping:
+- raw transcript payloads,
+- full provider responses,
+- or sensitive customer PII.
+
+Operational logs contain:
+- correlation identifiers,
+- processing metadata,
+- retry information,
+- and failure context,
+
+while minimizing exposure of customer conversation data.
+
+### Operational isolation
+
+Customer attribution is enforced throughout the pipeline using:
+- customer_id,
+- campaign_id,
+- and correlation_id.
+
+This improves:
+- auditability,
+- tenant isolation,
+- and token usage traceability for billing and debugging purposes.
+
+### Production hardening considerations
+
+A production deployment would additionally introduce:
+- secret rotation for provider credentials,
+- IAM-scoped storage access,
+- retention policies for recordings and transcripts,
+- audit logging for privileged access,
+- and centralized secrets management.
 
 ---
 
 ## 12. API Interface
 
-_Did you change the API contract (`POST /session/.../end`)? If yes, explain why. If no, explain why you kept it._
+The external API contract was intentionally kept unchanged:
+
+```http
+POST /session/{session_id}/interaction/{interaction_id}/end
+```
+
+The redesign focused on improving:
+- internal execution reliability,
+- asynchronous orchestration,
+- retry visibility,
+- rate-limit management,
+- and operational durability,
+
+without forcing upstream clients or telephony integrations to change behaviour.
+
+### Why the contract was preserved
+
+The webhook endpoint already represented the correct domain boundary:
+- a call has ended,
+- interaction state must be persisted,
+- and post-call processing should begin asynchronously.
+
+The primary problems were not API-shape problems; they were:
+- execution orchestration problems,
+- retry coordination problems,
+- durability gaps,
+- and missing rate-limit awareness.
+
+Changing the endpoint contract would not meaningfully solve those architectural issues.
+
+### Behavioural changes without contract changes
+
+Although the external interface remained stable, the internal processing semantics changed significantly.
+
+Key behavioural changes include:
+- all interactions now flow through the asynchronous processing pipeline,
+- short-call gating moved into worker processing,
+- recording retrieval and LLM analysis execute independently,
+- retries are centrally orchestrated,
+- and downstream actions execute only after durable processing completion.
+
+This preserves backward compatibility while improving operational correctness.
+
+### Potential future API evolution
+
+A future production system could optionally introduce:
+- explicit webhook acknowledgment IDs,
+- replay endpoints,
+- interaction processing status endpoints,
+- or customer-facing observability APIs.
+
+However, these were intentionally excluded from the current redesign to keep the scope focused on reliability and processing architecture rather than external API expansion.
 
 ---
 
 ## 13. Trade-offs & Alternatives Considered
 
-| Option | Why Considered | Why Rejected / What You Chose Instead |
-|--------|---------------|--------------------------------------|
-| ... | ... | ... |
+| Option | Why Considered | Why Rejected / What Was Chosen Instead |
+|---|---|---|
+| Kafka-based retry orchestration | Strong durability and replay guarantees | Too operationally heavy for the assignment scope. A lightweight Redis-backed retry queue with replay polling was sufficient for the current redesign. |
+| Distributed token bucket using Redis | Accurate global TPM coordination across workers | Added distributed coordination complexity. Current implementation uses process-local token buckets with documented limitations. |
+| Celery-only retries | Simpler retry implementation | Weak retry visibility and limited replay control. A centralized retry queue provided better observability and retry orchestration. |
+| ML-based interaction prioritization | Better prioritization accuracy | Rule-based prioritization was deterministic, cheaper, and easier to operationalize within the assignment timeline. |
+| Dedicated recording-processing workers | Better workload isolation | Added orchestration complexity. Parallel async execution (`asyncio.gather`) was sufficient for current requirements. |
+| Fully normalized workflow tables | Stronger relational modeling and indexing | Existing JSONB metadata allowed faster iteration, lower migration risk, and flexible workflow evolution. |
+| Hard circuit-breaker freeze logic | Simpler overload protection | Binary freezing causes operational disruption. Scheduler-based backpressure provided more graceful degradation under load. |
 
 ---
 
 ## 14. Known Weaknesses
 
-_What are the gaps in your design? What would you address next?_
+1. The current LLM scheduler is process-local. Each Celery worker maintains independent in-memory token buckets, which means global TPM enforcement is not perfectly coordinated across multiple workers. A production implementation should centralize token accounting using Redis or another distributed coordination layer.
+
+2. Retry durability still depends on Redis. A Redis outage or restart can affect:
+  - Celery broker state,
+  - retry queue state,
+  - and retry scheduling metadata.
+
+  A production system would likely move retry orchestration to Kafka, SQS, or a database-backed queue.
+
+3. `dequeue_ready()` is not fully atomic. Multiple retry pollers could theoretically dequeue and replay the same interaction simultaneously under race conditions. A production implementation should use Redis sorted sets, Lua scripts, or atomic queue primitives.
+
+4. The retry poller implementation is intentionally lightweight and process-driven. Under very large workloads, retry orchestration would likely need:
+  - dedicated workers,
+  - distributed scheduling,
+  - and dead-letter replay tooling.
+
+5. Idempotency protections are only partially implemented. Some downstream operations could still theoretically execute more than once during replay or worker recovery scenarios. A production implementation would introduce stronger idempotency guarantees using persistent execution markers or deduplication keys.
+
+6. The current implementation uses JSONB metadata for workflow state persistence. While flexible, this reduces:
+  - queryability,
+  - indexing efficiency,
+  - and relational enforcement
+
+  compared to fully normalized workflow tables.
+
+7. The scheduler currently estimates token usage before execution using heuristics. Actual token usage may differ from estimates, which can temporarily affect scheduling accuracy under burst traffic.
+
+8. Retry replay ordering is not strictly guaranteed. Interactions pushed back into the retry queue may not preserve perfect temporal ordering during repeated polling cycles.
+
+9. Recording retrieval still depends on external provider availability and eventual consistency guarantees from Exotel. Extremely delayed or missing recordings may still require manual operational intervention.
+
+10. Structured logging is implemented at the application layer but is not yet integrated with centralized observability tooling such as:
+  - Prometheus,
+  - Grafana,
+  - OpenTelemetry,
+  - or distributed tracing systems.
+
+11. The current implementation does not include dead-letter queue (DLQ) infrastructure for permanently failed interactions. Retry exhaustion is observable, but replay remains operationally manual.
+
+12. Customer prioritization is currently rule-based and configuration-driven. More sophisticated prioritization models could incorporate:
+  - customer SLAs,
+  - campaign urgency,
+  - or predictive business-value scoring.
+
+13. The retry queue currently operates independently from scheduler backlog pressure. A production implementation would likely unify:
+  - retry orchestration,
+  - scheduler pressure,
+  - and queue admission policies
+
+  into a single coordinated control plane.
+
+14. The current design focuses primarily on reliability and orchestration correctness. It does not yet include:
+  - autoscaling policies,
+  - workload-aware worker scaling,
+  - or infrastructure cost optimization strategies.
+
+16. Security hardening is intentionally lightweight for local development simplicity. Production systems would require:
+  - stronger IAM isolation,
+  - secret rotation,
+  - audit access controls,
+  - retention policies,
+  - and stricter tenant isolation guarantees.
+
+17. The current implementation improves worker crash recovery using:
+  - `acks_late=True`
+  - and `task_reject_on_worker_lost=True`
+
+  but does not yet implement true checkpoint-based resumability for partially completed workflows.
+
+18. Queue visibility currently relies primarily on structured logging and lightweight metrics. A production system would require:
+  - centralized dashboards,
+  - alert routing,
+  - SLO tracking,
+  - and historical workload analytics.
 
 ---
 
 ## 15. What I Would Do With More Time
 
-_Specific, prioritised list — not a generic wishlist._
+1. Move scheduler token accounting into Redis or another distributed coordination layer to enforce globally consistent TPM limits across multiple workers.
 
-1. ...
-2. ...
+2. Replace the lightweight retry poller with a dedicated distributed retry orchestration system supporting:
+   - atomic dequeue,
+   - delayed scheduling,
+   - dead-letter queues,
+   - and replay tooling.
+
+3. Introduce proper dead-letter queue (DLQ) handling for permanently failed interactions instead of relying on operational replay through logs.
+
+4. Add centralized observability tooling using:
+   - Prometheus,
+   - Grafana,
+   - OpenTelemetry
+
+5. Add richer operational dashboards for:
+   - scheduler backlog,
+   - retry pressure,
+   - token utilization,
+   - worker throughput,
+   - and customer-level queue visibility.
+
+6. Add adaptive token estimation and dynamic scheduling heuristics using historical interaction patterns and actual provider token usage.
+
+7. Replace lightweight rule-based prioritization with configurable SLA-aware scheduling and customer policy controls.
+
+8. Improve retry durability by reducing Redis dependence and introducing database-backed or streaming-based retry persistence.
+
+9. Add integration and chaos testing for:
+   - worker crashes,
+   - Redis restarts,
+   - provider throttling,
+   - and partial infrastructure failures.
+
+10. Improve recording orchestration by separating recording ingestion into an independently scalable worker pool under very high campaign concurrency.
+
+11. Normalize frequently queried workflow metadata into indexed relational columns or dedicated workflow tables for improved analytics and operational querying.
+
+12. Add customer-facing replay and processing visibility APIs for operational support and debugging workflows.
