@@ -29,12 +29,11 @@ A few things to notice as you read this file:
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
-from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.tasks.celery_tasks import process_interaction_end_background_task
 
 logger = logging.getLogger(__name__)
@@ -100,9 +99,12 @@ async def end_interaction(
         # those are also deleted from here and kept in the celery task only
         # No need for "best effort early trigger"
 
+        correlation_id = str(uuid4())
+
         celery_payload = {
             "interaction_id": str(interaction_id),
             "session_id": str(session_id),
+            "correlation_id": correlation_id,
             "lead_id": interaction["lead_id"],
             "campaign_id": interaction["campaign_id"],
             "customer_id": interaction["customer_id"],
@@ -126,6 +128,7 @@ async def end_interaction(
                 "interaction_id": str(interaction_id),
                 "customer_id": interaction["customer_id"],
                 "campaign_id": interaction["campaign_id"],
+                "correlation_id": correlation_id,
                 "celery_task_id": task.id,
                 # Notice what's NOT logged here: no queue depth, no estimated
                 # wait time, no indication of how backed up we are.
@@ -135,7 +138,7 @@ async def end_interaction(
         return InteractionEndResponse(
             status="ok",
             interaction_id=str(interaction_id),
-            message=""Post-call processing scheduled"",
+            message="Post-call processing scheduled",
         )
 
     except HTTPException:

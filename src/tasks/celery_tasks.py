@@ -44,6 +44,7 @@ from src.services.recording import fetch_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.services.retry_queue import retry_queue
 from src.services.metrics import metrics_tracker
+from src.models.enums import ProcessingStatus, LLMStatus, RecordingStatus
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
                               # But "redelivery" goes to the back of the queue,
                               # which at 100K depth means hours of extra wait.
     queue="postcall_processing",
+    task_reject_on_worker_lost=True
 )
 def process_interaction_end_background_task(self, payload: Dict[str, Any]):
     """
@@ -83,16 +85,18 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
             "celery_task_failed",
             extra={
                 "interaction_id": payload.get("interaction_id"),
+                "correlation_id": payload.get("correlation_id"),
                 "error": str(e),
                 "attempt": self.request.retries,
             },
         )
         # Failed tasks earlier went into PostCallRetryQueue (Redis) AND Celery retries.
         # Two retry mechanisms that don't know about each other. 
-        #Removing the Celery retry for now to prevent race conditions and extra workloads.
+        # Update: Removing the Celery retry for now to prevent race conditions and extra workloads.
         loop.run_until_complete(
             retry_queue.enqueue_retry(
                 interaction_id=payload["interaction_id"],
+                correlation_id=payload["correlation_id"],
                 error=str(e),
                 payload=payload,
             )
@@ -101,21 +105,58 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
     finally:
         loop.close()
 
+# Missing scheduling for now, but a skeletal implement
+@celery_app.task
+def process_retry_queue():
+    """
+    A simple implementation to actually run the queued tasks after a delay
+    """
+    asyncio.run(_process_ready_retries())
 
-async def _process_interaction(task, payload: Dict[str, Any]):
+async def _process_ready_retries():
+    ready_entries = await retry_queue.dequeue_ready()
+
+    for entry in ready_entries:
+        logger.warning(
+            "retry_requeued",
+            extra={
+                "interaction_id": entry.interaction_id,
+                "correlation_id": entry.correlation_id,
+                "attempt": entry.attempt,
+                "stage": "retry_queue",
+            },
+        )
+
+        process_interaction_end_background_task.delay(
+            entry.payload
+        )
+
+async def _process_interaction(payload: Dict[str, Any]):
     interaction_id = payload["interaction_id"]
 
+    # This will improve visibility and logging with status of each 
+    # individual task unit properly mentioned
+    await _update_processing_metadata(
+        interaction_id=interaction_id,
+        metadata_updates={
+            "processing_status": ProcessingStatus.PROCESSING.value,
+            "llm_status": LLMStatus.PENDING.value,
+            "recording_status": RecordingStatus.PENDING.value,
+            "last_error": None,
+        },
+    )
     await metrics_tracker.track_processing_started(interaction_id)
 
     ctx = PostCallContext(
         interaction_id=interaction_id,
         session_id=payload["session_id"],
+        correlation_id=payload("correlation_id"),
         lead_id=payload["lead_id"],
         campaign_id=payload["campaign_id"],
         customer_id=payload["customer_id"],
         agent_id=payload["agent_id"],
         call_sid=payload.get("call_sid", ""),
-        transcript_text=payload.get("transcript_text", ""),
+        transcript_text=payload.get("transcript", ""),
         conversation_data=payload.get("conversation_data", {}),
         additional_data=payload.get("additional_data", {}),
         ended_at=datetime.fromisoformat(payload["ended_at"]),
@@ -145,7 +186,8 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     
     recording_task = asyncio.create_task(
         fetch_and_upload_recording(
-            interaction_id=ctx.interaction_id,
+            interaction_id=interaction_id,
+            correlation_id=ctx.correlation_id,
             call_sid=ctx.call_sid,
             exotel_account_id=ctx.exotel_account_id or "",
         )
@@ -174,7 +216,15 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     )
 
     if recording_s3_key is None:
-        # If recording_s3_key is None, flag it as an exception
+        # If recording_s3_key is None, flag it 
+        await _update_processing_metadata(
+            interaction_id=interaction_id,
+            correlation_id=ctx.correlation_id,
+            metadata_updates={
+                "recording_status": RecordingStatus.FAILED.value,
+                "last_error": "Recording upload error",
+            },
+        )
         logger.exception(
             "recording_pipeline_failed",
             extra={
@@ -183,8 +233,33 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             },
         )
 
+    else:
+        await _update_processing_metadata(
+            interaction_id=interaction_id,
+            correlation_id=ctx.correlation_id,
+            metadata_updates={
+                "recording_status": RecordingStatus.UPLOADED.value,
+            },
+        )
     if isinstance(llm_result,Exception):
+        await _update_processing_metadata(
+            interaction_id=ctx.interaction_id,
+            correlation_id=ctx.correlation_id,
+            metadata_updates={
+                "llm_status": LLMStatus.FAILED.value,
+                "last_error": str(llm_result),
+            },
+        )
         raise llm_result
+    
+    else:
+        await _update_processing_metadata(
+            interaction_id=ctx.interaction_id,
+            correlation_id=ctx.correlation_id,
+            metadata_updates={
+                "llm_status": LLMStatus.COMPLETED.value,
+            },
+        )
     await metrics_tracker.track_processing_completed(
         interaction_id, llm_result.tokens_used, llm_result.latency_ms
     )
@@ -198,6 +273,7 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     try:
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
+            correlation_id=ctx.correlation_id,
             session_id=ctx.session_id,
             campaign_id=ctx.campaign_id,
             analysis_result=llm_result.raw_response,
@@ -213,7 +289,47 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         await update_lead_stage(
             lead_id=ctx.lead_id,
             interaction_id=ctx.interaction_id,
+            correlation_id=ctx.correlation_id,
             call_stage=llm_result.call_stage,
         )
     except Exception as e:
+        await _update_processing_metadata(
+            interaction_id=ctx.interaction_id,
+            correlation_id=ctx.correlation_id,
+            metadata_updates={
+                "processing_status": ProcessingStatus.FAILED.value,
+                "last_error": str(e),
+            },
+        )
         logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+
+    # Final Processing Status flag
+    await _update_processing_metadata(
+        interaction_id=ctx.interaction_id,
+        metadata_updates={
+            "processing_status": ProcessingStatus.COMPLETED.value,
+        },
+    )
+
+async def _update_processing_metadata(
+    interaction_id: str,
+    correlation_id: str,
+    metadata_updates: dict,
+) -> None:
+    """
+    Persist processing state updates into interaction_metadata.
+
+    In production this performs:
+        interaction_metadata = interaction_metadata || updates
+    """
+
+    logger.info(
+        "interaction_metadata_updated",
+        extra={
+            "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
+            "metadata_updates": metadata_updates,
+        },
+    )
+
+    # Mock implementation for assessment.

@@ -44,6 +44,7 @@ class RecordingFetchResult:
 
 async def fetch_and_upload_recording(
     interaction_id: str,
+    correlation_id: str,
     call_sid: str,
     exotel_account_id: str,
 ) -> Optional[str]:
@@ -71,11 +72,12 @@ async def fetch_and_upload_recording(
 
             if recording_result.status.value == RecordingFetchStatus.READY.value:
                 # Found the recording, upload it to the URL
-                s3_key = await _upload_to_s3(recording_result.recording_url, interaction_id)
+                s3_key = await _upload_to_s3(recording_result.recording_url, interaction_id, correlation_id)
                 logger.info(
                     "recording_upload_successful",
                     extra={
                         "interaction_id": interaction_id,
+                        "correlation_id": correlation_id,
                         "call_sid": call_sid,
                         "recording_retry_count": attempt-1,
                         "recording_failure_reason": None,
@@ -91,6 +93,7 @@ async def fetch_and_upload_recording(
                     "recording_retry_scheduled",
                     extra={
                         "interaction_id": interaction_id,
+                        "correlation_id": correlation_id,
                         "call_sid": call_sid,
                         "attempt": attempt,
                         "waited_seconds": time_delay,
@@ -103,6 +106,7 @@ async def fetch_and_upload_recording(
                     "recording_fetch_error",
                     extra={
                         "interaction_id": interaction_id,
+                        "correlation_id": correlation_id,
                         "call_sid": call_sid,
                         "recording_retry_count": attempt-1,
                         "recording_failure_reason": "Failure at upstream while getting the recording details",
@@ -116,14 +120,19 @@ async def fetch_and_upload_recording(
             # no retry path and no way to replay just the recording upload later.
             logger.error(
                 "recording_upload_error",
-                extra={"interaction_id": interaction_id, "error": str(e)},
+                extra={
+                    "interaction_id": interaction_id, 
+                    "correlation_id": correlation_id,
+                    "error": str(e)
+                },
             )
             return None
         
     logger.error(
         "recording_fetch_exhausted",
         extra={
-            "interaction_id": interaction_id,
+            "interaction_id": interaction_id, 
+            "correlation_id": correlation_id,
             "call_sid": call_sid,
             "attempts": attempt,
         },
@@ -163,7 +172,7 @@ async def _fetch_exotel_recording_url(
         return RecordingFetchResult(status=RecordingFetchStatus.FAILED,recording_url=None)
 
 
-async def _upload_to_s3(recording_url: str, interaction_id: str) -> str:
+async def _upload_to_s3(recording_url: str, interaction_id: str, correlation_id: str) -> str:
     """
     Download the recording from Exotel's URL and upload to S3.
 
@@ -174,10 +183,13 @@ async def _upload_to_s3(recording_url: str, interaction_id: str) -> str:
     If this crashes after the upload but before the DB write, the file is in S3
     but the interaction row doesn't know about it. Currently no reconciliation job.
     """
-    s3_key = f"recordings/{interaction_id}.mp3"
+    s3_key = f"recordings/{interaction_id}_{correlation_id}.mp3"
 
     logger.info(
         "recording_uploaded",
-        extra={"interaction_id": interaction_id, "s3_key": s3_key},
+        extra={
+            "interaction_id": interaction_id, 
+            "correlation_id": correlation_id,
+            "s3_key": s3_key},
     )
     return s3_key

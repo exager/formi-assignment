@@ -44,12 +44,13 @@ class PostCallContext:
     """Everything needed to process one completed call."""
     interaction_id: str
     session_id: str
+    correlation_id: str
     lead_id: str
     campaign_id: str
     customer_id: str  # The business using the platform (not the person called)
     agent_id: str
     call_sid: str     # Exotel's identifier for the call
-    transcript_text: str
+    transcript_text: list[dict]
     conversation_data: dict
     additional_data: dict  # Arbitrary metadata from the dialler (campaign config, etc.)
     ended_at: datetime
@@ -64,8 +65,8 @@ class AnalysisResult:
     raw_response: Dict[str, Any] = field(default_factory=dict)
     tokens_used: int = 0                                    # Actual tokens consumed — source of truth for billing
     latency_ms: float = 0
-    provider: str = "default"
-    model: str = "default"
+    provider: Optional[str]
+    model: Optional[str]
 
 
 class PostCallProcessor:
@@ -106,14 +107,14 @@ class PostCallProcessor:
         # Placing the short transcript call text here, so that the endpoints
         # stay logic-free, and no duplication of celery tasks take place, for
         # any kind of transcript received.
-        if self._should_skip_llm(transcript_text):
+        if self._should_skip_llm(ctx.transcript):
             logger.info(
                 "llm_processing_skipped_short_transcript",
                 extra={
                     "interaction_id": ctx.interaction_id,
                     "customer_id": ctx.customer_id,
                     "campaign_id": ctx.campaign_id,
-                    "transcript_turns": len(transcript_text),
+                    "transcript_turns": len(ctx.transcript_text),
                 },
             )
 
@@ -126,14 +127,14 @@ class PostCallProcessor:
                 latency_ms=0.0,
             )
         
-        transcript_text = "\n".join(
+        transcript_string = "\n".join(
             f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
             for turn in ctx.transcript_text
         )
 
         try:
             prompt = self._build_analysis_prompt(
-                ctx.transcript_text,
+                transcript_string,
                 ctx.additional_data,
                 single_prompt,
             )
@@ -142,10 +143,11 @@ class PostCallProcessor:
             # Before the call, take a rough estimate on the tokens that prompt will produce
             estimated_tokens = self._estimate_tokens(prompt)
             # Prioritise on the basis of Sparse Ranking of favourable keywords
-            priority = self._determine_priority(ctx.transcript_text)
+            priority = self._determine_priority(ctx.transcript_string)
 
             request = LLMRequest(
                 interaction_id=ctx.interaction_id,
+                correlation_id=ctx.correlation_id,
                 customer_id=ctx.customer_id,
                 campaign_id=ctx.campaign_id,
                 estimated_tokens=estimated_tokens,
@@ -179,13 +181,6 @@ class PostCallProcessor:
                 },
             )
 
-            analysis_result =  AnalysisResult(
-                call_stage=result.call_stage,
-                raw_response=response,
-                tokens_used=result.tokens_used, 
-                latency_ms=result.latency_ms,
-            )
-
         except Exception as e:
             logger.exception(
                 "postcall_analysis_failed",
@@ -203,7 +198,7 @@ class PostCallProcessor:
         finally:
             await circuit_breaker.record_postcall_end()
         
-        return analysis_result
+        return result
 
     def _build_analysis_prompt(
         self,

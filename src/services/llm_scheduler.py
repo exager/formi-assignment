@@ -51,6 +51,7 @@ class LLMRequest:
     """
 
     interaction_id: str
+    correlation_id: str
     customer_id: str
     campaign_id: str
     estimated_tokens: int
@@ -169,6 +170,7 @@ class LLMScheduler:
                     "customer_budget_exhausted",
                     extra={
                         "interaction_id": request.interaction_id,
+                        "correlation_id": request.correlation_id,
                         "customer_id": request.customer_id,
                         "campaign_id": request.campaign_id,
                         "estimated_tokens": request.estimated_tokens,
@@ -189,6 +191,7 @@ class LLMScheduler:
                     "global_tpm_exhausted",
                     extra={
                         "interaction_id": request.interaction_id,
+                        "correlation_id": request.correlation_id,
                         "customer_id": request.customer_id,
                         "campaign_id": request.campaign_id,
                         "estimated_tokens": request.estimated_tokens,
@@ -204,6 +207,7 @@ class LLMScheduler:
                 "llm_request_admitted",
                 extra={
                     "interaction_id": request.interaction_id,
+                    "correlation_id": request.correlation_id,
                     "customer_id": request.customer_id,
                     "campaign_id": request.campaign_id,
                     "estimated_tokens": request.estimated_tokens,

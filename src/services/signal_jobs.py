@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 async def trigger_signal_jobs(
     interaction_id: str,
+    correlation_id: str,
     session_id: str,
     campaign_id: str,
     analysis_result: Dict[str, Any],
@@ -50,6 +51,8 @@ async def trigger_signal_jobs(
         "signal_jobs_triggered",
         extra={
             "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
+            "session_id": session_id,
             "campaign_id": campaign_id,
             "has_analysis": bool(analysis_result),
             # has_analysis=False means we fired with an empty payload.
@@ -62,6 +65,7 @@ async def trigger_signal_jobs(
 async def update_lead_stage(
     lead_id: str,
     interaction_id: str,
+    correlation_id: str,
     call_stage: str,
 ) -> None:
     """
@@ -83,6 +87,7 @@ async def update_lead_stage(
         extra={
             "lead_id": lead_id,
             "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
             "new_stage": call_stage,
         },
     )

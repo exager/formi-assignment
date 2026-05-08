@@ -38,6 +38,7 @@ RETRY_STATE_PREFIX = "postcall:retry_state:"
 @dataclass
 class RetryEntry:
     interaction_id: str
+    correlation_id: str
     attempt: int
     last_error: str
     next_retry_at: float
@@ -51,7 +52,7 @@ class PostCallRetryQueue:
         self.retry_delay = retry_delay_seconds  # Same delay regardless of error type
 
     async def enqueue_retry(
-        self, interaction_id: str, error: str, payload: dict
+        self, interaction_id: str, correlation_id: str, error: str, payload: dict
     ) -> bool:
         """
         Push a failed interaction onto the retry queue.
@@ -69,8 +70,11 @@ class PostCallRetryQueue:
                 "retry_exhausted",
                 extra={
                     "interaction_id": interaction_id,
+                    "correlation_id": correlation_id,
                     "attempts": current_attempt,
                     "last_error": error,
+                    "stage": "retry_queue",
+                    "requires_manual_replay": True,
                     # The payload containing the full transcript and context
                     # is dropped here. There's no dead-letter store.
                     # If you need to replay this interaction, you have to find
@@ -82,13 +86,15 @@ class PostCallRetryQueue:
         next_attempt = current_attempt + 1
         entry = {
             "interaction_id": interaction_id,
+            "correlation_id": correlation_id,
             "attempt": next_attempt,
             "last_error": error,
-            "next_retry_at": time.time() + self.retry_delay,
+            "next_retry_at": time.time() + min(self.retry_delay * (2 ** current_attempt), 900),
             "payload": payload,
         }
 
-        await redis_client.set(state_key, next_attempt)
+        # Added a TTL to the retry state
+        await redis_client.set(state_key, next_attempt, ex = 86400)
         # No TTL set on state_key — this key lives in Redis indefinitely
         # for interactions that exhaust their retries.
 
@@ -98,6 +104,7 @@ class PostCallRetryQueue:
             "retry_enqueued",
             extra={
                 "interaction_id": interaction_id,
+                "correlation_id": correlation_id,
                 "attempt": next_attempt,
                 "next_retry_at": entry["next_retry_at"],
             },
@@ -118,7 +125,7 @@ class PostCallRetryQueue:
         now = time.time()
         ready = []
 
-        queue_length = await redis_client.llen(RETRY_QUEUE_KEY)
+        queue_length = await self.get_queue_depth()
         for _ in range(queue_length):
             raw = await redis_client.lpop(RETRY_QUEUE_KEY)
             if not raw:
